@@ -6,7 +6,25 @@ from datetime import datetime, timedelta
 from typing import Optional
 import requests
 
-YANDEX_API_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YANDEX_NATIVE_API_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YANDEX_OPENAI_API_URL = "https://llm.api.cloud.yandex.net/v1/chat/completions"
+
+TASK_PARSE_SCHEMA = {
+    "name": "task_parse_result",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "due_date": {"type": ["string", "null"]},
+            "repeat_flag": {"type": ["string", "null"]},
+            "is_all_day": {"type": "boolean"},
+            "priority": {"type": "integer", "enum": [0, 1, 3, 5]}
+        },
+        "required": ["title", "due_date", "repeat_flag", "is_all_day", "priority"],
+        "additionalProperties": False
+    }
+}
 
 
 @dataclass
@@ -133,6 +151,151 @@ Output: {{"title": "Встреча с клиентом", "due_date": "{dates['ne
 IMPORTANT: Calculate actual dates based on today's date and weekday from CURRENT CONTEXT. For recurring tasks with weekday (e.g. "каждую среду"), set due_date to the NEXT occurrence of that weekday."""
 
 
+def _build_simple_system_prompt(current_date: str, current_weekday: str, timezone: str) -> str:
+    """Build simplified system prompt for structured output API (schema defines format)."""
+    return f"""You are a task parser for a todo app. Parse Russian natural language input into structured task data.
+
+CURRENT CONTEXT:
+- Today: {current_date} ({current_weekday})
+- Timezone: {timezone}
+
+PARSING RULES:
+
+TITLE: Extract clear, actionable task in imperative form:
+- "Мне надо заказать шторы" → "Заказать шторы"
+- "хочу бегать" → "Пробежка"
+
+DATE/TIME (ISO 8601: yyyy-MM-ddTHH:mm:ss+0000):
+- "сегодня" = today, "завтра" = tomorrow, "послезавтра" = +2 days
+- "в 19" / "до 19" / "к 19" = 19:00:00
+- "утром" = 09:00, "в обед" = 13:00, "вечером" = 18:00
+- "в понедельник" = next Monday
+- No time specified → is_all_day = true, time = 00:00:00
+- No date/time → due_date = null
+
+REPEAT (RRULE format):
+- "каждый день" → RRULE:FREQ=DAILY
+- "каждую неделю" → RRULE:FREQ=WEEKLY
+- "каждую среду" → RRULE:FREQ=WEEKLY;BYDAY=WE
+- "по будням" → RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR
+- Day codes: MO,TU,WE,TH,FR,SA,SU
+- For recurring: due_date = first occurrence
+
+PRIORITY:
+- "срочно"/"важно"/"ASAP" → 5
+- "не срочно" → 1
+- Default → 0"""
+
+
+def _dict_to_result(data: dict, fallback_title: str) -> TaskParseResult:
+    """Convert parsed dict to TaskParseResult."""
+    return TaskParseResult(
+        title=data.get("title") or fallback_title,
+        due_date=data.get("due_date"),
+        repeat_flag=data.get("repeat_flag"),
+        is_all_day=data.get("is_all_day", False),
+        priority=data.get("priority", 0)
+    )
+
+
+def _call_openai_compatible_api(
+    user_input: str,
+    api_key: str,
+    folder_id: str,
+    system_prompt: str
+) -> Optional[dict]:
+    """Call YandexGPT via OpenAI-compatible API with structured output."""
+    payload = {
+        "model": f"gpt://{folder_id}/yandexgpt-lite/latest",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 500,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": TASK_PARSE_SCHEMA
+        }
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {api_key}",
+        "x-folder-id": folder_id,
+    }
+
+    try:
+        response = requests.post(
+            YANDEX_OPENAI_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return None
+
+        result = response.json()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return json.loads(content) if content else None
+
+    except Exception:
+        return None
+
+
+def _call_native_api(
+    user_input: str,
+    api_key: str,
+    folder_id: str,
+    system_prompt: str
+) -> Optional[dict]:
+    """Call YandexGPT via Native API with prompt engineering."""
+    payload = {
+        "modelUri": f"gpt://{folder_id}/yandexgpt-lite/latest",
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.1,
+            "maxTokens": "500",
+        },
+        "messages": [
+            {"role": "system", "text": system_prompt},
+            {"role": "user", "text": user_input}
+        ]
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Api-Key {api_key}",
+        "x-folder-id": folder_id,
+    }
+
+    try:
+        response = requests.post(
+            YANDEX_NATIVE_API_URL,
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            return None
+
+        result = response.json()
+        content = (
+            result.get("result", {})
+            .get("alternatives", [{}])[0]
+            .get("message", {})
+            .get("text", "")
+        )
+
+        json_content = _extract_json(content)
+        return json.loads(json_content) if json_content else None
+
+    except Exception:
+        return None
+
+
 def parse_task_with_llm(
     user_input: str,
     api_key: str,
@@ -142,6 +305,9 @@ def parse_task_with_llm(
     timezone: str = "+0000"
 ) -> TaskParseResult:
     """Parse natural language task input using YandexGPT.
+
+    Uses OpenAI-compatible API with structured output as primary method,
+    falls back to Native API with prompt engineering if that fails.
 
     Args:
         user_input: Natural language task description
@@ -154,65 +320,20 @@ def parse_task_with_llm(
     Returns:
         TaskParseResult with extracted fields
     """
-    model_uri = f"gpt://{folder_id}/yandexgpt-lite/latest"
+    # 1. Try OpenAI-compatible API with structured output (guaranteed JSON schema)
+    simple_prompt = _build_simple_system_prompt(current_date, current_weekday, timezone)
+    data = _call_openai_compatible_api(user_input, api_key, folder_id, simple_prompt)
+    if data:
+        return _dict_to_result(data, user_input)
 
-    payload = {
-        "modelUri": model_uri,
-        "completionOptions": {
-            "stream": False,
-            "temperature": 0.1,
-            "maxTokens": "500",
-        },
-        "messages": [
-            {
-                "role": "system",
-                "text": _build_system_prompt(current_date, current_weekday, timezone)
-            },
-            {
-                "role": "user",
-                "text": user_input
-            }
-        ]
-    }
+    # 2. Fallback: Native API with detailed prompt engineering
+    full_prompt = _build_system_prompt(current_date, current_weekday, timezone)
+    data = _call_native_api(user_input, api_key, folder_id, full_prompt)
+    if data:
+        return _dict_to_result(data, user_input)
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Api-Key {api_key}",
-        "x-folder-id": folder_id,
-    }
-
-    try:
-        response = requests.post(
-            YANDEX_API_URL,
-            json=payload,
-            headers=headers,
-            timeout=10
-        )
-
-        if response.status_code != 200:
-            return _fallback_parse(user_input)
-
-        result = response.json()
-        content = (
-            result.get("result", {})
-            .get("alternatives", [{}])[0]
-            .get("message", {})
-            .get("text", "")
-        )
-
-        json_content = _extract_json(content)
-        data = json.loads(json_content)
-
-        return TaskParseResult(
-            title=data.get("title", user_input),
-            due_date=data.get("due_date"),
-            repeat_flag=data.get("repeat_flag"),
-            is_all_day=data.get("is_all_day", False),
-            priority=data.get("priority", 0)
-        )
-
-    except Exception:
-        return _fallback_parse(user_input)
+    # 3. Final fallback: simple parser (no LLM)
+    return _fallback_parse(user_input)
 
 
 def _extract_json(content: str) -> str:

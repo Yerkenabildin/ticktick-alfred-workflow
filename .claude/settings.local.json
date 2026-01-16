@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:developer.ticktick.com)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python3:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat: migrate YandexGPT to OpenAI-compatible API with structured JSON output\n\n- Add TASK_PARSE_SCHEMA for guaranteed JSON format via response_format\n- Add OpenAI-compatible API endpoint \\(/v1/chat/completions\\)\n- Implement fallback chain: OpenAI API → Native API → simple parser\n- Refactor into separate functions: _call_openai_compatible_api, _call_native_api\n- Add simplified system prompt for structured output \\(schema defines format\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push:*)"
     ]
   }
 }
